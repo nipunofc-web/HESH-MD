@@ -1,21 +1,24 @@
 const express = require('express');
 const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
 const OpenAI = require('openai');
 const NodeCache = require('node-cache');
 const { 
   default: makeWASocket, 
-  useMultiFileAuthState, 
   DisconnectReason, 
   delay, 
   Browsers,
   makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 
+const { useMongoDBAuthState, Auth } = require('./auth');
+
 const app = express();
 const port = process.env.PORT || 3000;
 app.use(express.json());
+
+// ඔබගේ MongoDB ලින්ක් එක
+const MONGODB_URI = 'mongodb+srv://kethmi12345_db_user:nipun1234@cluster0.3fhoect.mongodb.net/';
 
 const openai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
@@ -66,15 +69,17 @@ app.get('/', (req, res) => {
           if (!phone) return alert('Enter Number!');
           const btn = document.getElementById('btn');
           btn.innerText = 'GENERATING...';
+          btn.disabled = true;
           try {
             const res = await fetch('/pair?num=' + phone);
             const data = await res.json();
             if (data.code) {
               document.getElementById('codeBox').innerText = data.code;
               document.getElementById('codeBox').style.display = 'block';
-            } else { alert('Error!'); }
+            } else { alert(data.error || 'Error!'); }
           } catch(e) { alert('Server Error!'); }
           btn.innerText = 'GENERATE CODE';
+          btn.disabled = false;
         }
       </script>
     </body>
@@ -82,19 +87,12 @@ app.get('/', (req, res) => {
   `);
 });
 
-let sock = null;
+let activeSessions = {};
 
-async function initWhatsApp(phoneNumber = null) {
-  const sessionDir = path.join(__dirname, 'session_auth');
+async function initWhatsApp(phoneNumber) {
+  if (activeSessions[phoneNumber]) return activeSessions[phoneNumber];
 
-  if (phoneNumber && sock) {
-    sock.ev.removeAllListeners();
-    if (sock.ws) sock.ws.close();
-    sock = null;
-    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { state, saveCreds, clearSessionData } = await useMongoDBAuthState(phoneNumber);
   const msgRetryCounterCache = new NodeCache();
   const logger = pino({ level: 'silent' });
 
@@ -103,15 +101,17 @@ async function initWhatsApp(phoneNumber = null) {
     keys: makeCacheableSignalKeyStore(state.keys, logger),
   };
 
-  sock = makeWASocket({
-    version: [2, 3000, 1015901307], // ස්ථිර වර්ෂන් එකක් ලබා දී ඇත
+  const sock = makeWASocket({
+    version: [2, 3000, 1015901307],
     auth,
     logger,
     printQRInTerminal: false,
-    browser: Browsers.windows('Desktop'), // Windows Profile භාවිතා කිරීම
+    browser: Browsers.windows('Desktop'),
     msgRetryCounterCache,
     syncFullHistory: false
   });
+
+  activeSessions[phoneNumber] = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -119,11 +119,14 @@ async function initWhatsApp(phoneNumber = null) {
     const { connection, lastDisconnect } = update;
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      if (statusCode !== DisconnectReason.loggedOut) {
-        setTimeout(initWhatsApp, 5000);
+      delete activeSessions[phoneNumber];
+      if (statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 403) {
+        setTimeout(() => initWhatsApp(phoneNumber), 5000);
       } else {
-        if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+        if (typeof clearSessionData === 'function') await clearSessionData();
       }
+    } else if (connection === 'open') {
+      console.log(`✅ N TECH AI Connected for: ${phoneNumber}`);
     }
   });
 
@@ -142,27 +145,58 @@ async function initWhatsApp(phoneNumber = null) {
     }
   });
 
-  if (phoneNumber && !sock.authState.creds.registered) {
-    await delay(2000); 
-    const code = await sock.requestPairingCode(phoneNumber);
-    return code?.match(/.{1,4}/g)?.join("-") || code;
-  }
+  return sock;
 }
 
 app.get('/pair', async (req, res) => {
-  const num = req.query.num;
+  let num = req.query.num;
   if (!num) return res.status(400).json({ error: 'Number required' });
+  
   try {
-    const code = await initWhatsApp(num);
-    return res.json({ code });
+    // පැරණි Session එකක් ඇත්නම් එය ඉවත් කිරීම
+    if (activeSessions[num]) {
+        try { activeSessions[num].ws?.close(); } catch(e) {}
+        delete activeSessions[num];
+    }
+    
+    // DB එකේ ඇති පැරණි දත්ත මකා දැමීම
+    await Auth.deleteMany({ _id: new RegExp(`^${num}-`) });
+
+    const sock = await initWhatsApp(num);
+
+    if (!sock.authState.creds.registered) {
+      await delay(2000);
+      
+      // Timeout එක හැසිරවීමට Promise.race යෙදීම (තත්පර 15ක් ඇතුළත)
+      const codePromise = sock.requestPairingCode(num);
+      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 15000));
+      
+      const code = await Promise.race([codePromise, timeoutPromise]);
+      const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+      
+      return res.json({ code: formattedCode });
+    } else {
+        return res.status(400).json({ error: 'Already Linked!' });
+    }
   } catch (err) {
-    return res.status(500).json({ error: 'Failed' });
+    console.error('Pairing Error:', err);
+    return res.status(500).json({ error: 'Rate Limited! Please try again later.' });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server running on ${port}`);
-  if (fs.existsSync(path.join(__dirname, 'session_auth', 'creds.json'))) {
-    initWhatsApp();
-  }
-});
+// මුලින්ම MongoDB සම්බන්ධ කර පසුව Server එක ආරම්භ කිරීම
+mongoose.connect(MONGODB_URI)
+  .then(async () => {
+    console.log('🍃 MongoDB Connected Successfully!');
+    app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+    
+    // Server එක Restart වන විට කලින් සම්බන්ධ වී ඇති අංක නැවත සම්බන්ධ කිරීම
+    const sessions = await Auth.find({ _id: /-creds$/ });
+    console.log(`🔄 Found ${sessions.length} saved sessions.`);
+    for (const session of sessions) {
+        const number = session._id.split('-creds')[0];
+        initWhatsApp(number);
+        await delay(3000);
+    }
+  })
+  .catch(err => console.log('MongoDB Connection Error:', err));
