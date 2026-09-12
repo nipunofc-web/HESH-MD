@@ -126,7 +126,16 @@ async function initWhatsApp(phoneNumber) {
         if (typeof clearSessionData === 'function') await clearSessionData();
       }
     } else if (connection === 'open') {
-      console.log(`✅ N TECH AI Connected for: ${phoneNumber}`);
+      console.log(`✅ HESH-MD AI Connected for: ${phoneNumber}`);
+      
+      // ලින්ක් වූ වහාම ඔබේ අංකයටම මැසේජ් එකක් යැවීම
+      try {
+        const botJid = `${phoneNumber}@s.whatsapp.net`;
+        const connectedMsg = `*✅ HESH-MD BOT CONNECTED!*\n\nඔබගේ බොට් සාර්ථකව සක්‍රිය විය. වැඩදැයි පරීක්ෂා කිරීමට *.alive* ලෙස යවන්න.`;
+        await sock.sendMessage(botJid, { text: connectedMsg });
+      } catch (err) {
+        console.error('Welcome message error:', err);
+      }
     }
   });
 
@@ -138,8 +147,16 @@ async function initWhatsApp(phoneNumber) {
     const sender = msg.key.remoteJid;
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
-    if (text && text.startsWith('.ai ')) {
-      const query = text.replace('.ai ', '').trim();
+    if (!text) return;
+
+    // .alive කමාන්ඩ් එක
+    if (text.toLowerCase() === '.alive') {
+      const aliveMsg = `*👋 HESH-MD BOT IS ALIVE!* 🚀\n\n✅ System is fully operational.\n✅ Session is securely saved in MongoDB.`;
+      await sock.sendMessage(sender, { text: aliveMsg }, { quoted: msg });
+    } 
+    // .ai කමාන්ඩ් එක
+    else if (text.toLowerCase().startsWith('.ai ')) {
+      const query = text.replace(/.ai /i, '').trim();
       const reply = await askAI(query);
       await sock.sendMessage(sender, { text: reply }, { quoted: msg });
     }
@@ -153,21 +170,17 @@ app.get('/pair', async (req, res) => {
   if (!num) return res.status(400).json({ error: 'Number required' });
   
   try {
-    // පැරණි Session එකක් ඇත්නම් එය ඉවත් කිරීම
     if (activeSessions[num]) {
         try { activeSessions[num].ws?.close(); } catch(e) {}
         delete activeSessions[num];
     }
     
-    // DB එකේ ඇති පැරණි දත්ත මකා දැමීම
     await Auth.deleteMany({ _id: new RegExp(`^${num}-`) });
 
     const sock = await initWhatsApp(num);
 
     if (!sock.authState.creds.registered) {
       await delay(2000);
-      
-      // Timeout එක හැසිරවීමට Promise.race යෙදීම (තත්පර 15ක් ඇතුළත)
       const codePromise = sock.requestPairingCode(num);
       const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 15000));
       
@@ -184,13 +197,11 @@ app.get('/pair', async (req, res) => {
   }
 });
 
-// මුලින්ම MongoDB සම්බන්ධ කර පසුව Server එක ආරම්භ කිරීම
 mongoose.connect(MONGODB_URI)
   .then(async () => {
     console.log('🍃 MongoDB Connected Successfully!');
     app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
     
-    // Server එක Restart වන විට කලින් සම්බන්ධ වී ඇති අංක නැවත සම්බන්ධ කිරීම
     const sessions = await Auth.find({ _id: /-creds$/ });
     console.log(`🔄 Found ${sessions.length} saved sessions.`);
     for (const session of sessions) {
